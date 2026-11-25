@@ -1,6 +1,7 @@
 // Functional self-check for the learning-assistant plugin, both halves.
 import vm from "node:vm";
 import fs from "node:fs";
+import { registerHooks } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -150,7 +151,18 @@ try {
 console.log("\n== 2) Host 半 ==");
 const home = fs.mkdtempSync(path.join(os.tmpdir(), "tg-home-"));
 process.env.DSH_HOME = home;
-const host = await import(path.join(pluginDir, "lib/index.js"));
+const hostUrl = new URL("../lib/index.js", import.meta.url).href;
+// The real dsh runtime supplies defineTool. This test registers the definition
+// with a fake host, so it only needs the definition passed through unchanged.
+const mockDshTools = registerHooks({
+	resolve(specifier, context, nextResolve) {
+		if (specifier === "@deepseek-ai/dsh-tools" && context.parentURL === hostUrl) {
+			return { url: "data:text/javascript,export const defineTool = (definition) => definition", shortCircuit: true };
+		}
+		return nextResolve(specifier, context);
+	}
+});
+const host = await import(hostUrl).finally(() => mockDshTools.deregister());
 ok("host name", host.name === "learning-assistant", host.name);
 ok("host inject 含 tools/webServer", host.inject.includes("tools") && host.inject.includes("webServer"), JSON.stringify(host.inject));
 

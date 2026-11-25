@@ -1,6 +1,7 @@
 // Functional self-check for the learning-assistant plugin, both halves.
 import vm from "node:vm";
 import fs from "node:fs";
+import { registerHooks } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,6 +48,7 @@ const React = {
 		return { type, props: props ?? {}, children };
 	},
 	useState: (initial) => [typeof initial === "function" ? initial() : initial, () => {}],
+	useRef: (initial) => ({ current: initial }),
 	useEffect: () => {},
 	useLayoutEffect: () => {}
 };
@@ -129,6 +131,7 @@ try {
 	const text = JSON.stringify(panelTree);
 	ok("渲染包含词条名", text.includes("KV Cache"));
 	ok("渲染包含解释", text.includes("注意力键值"));
+	ok("词条列表提供可访问的搜索框", text.includes('"role":"searchbox"') && text.includes('"aria-label":"搜索术语"'));
 	ok("渲染包含树节点", text.includes("Transformer 自注意力"));
 	ok("外链带 noopener", text.includes("noopener noreferrer"));
 } catch (error) {
@@ -150,7 +153,18 @@ try {
 console.log("\n== 2) Host 半 ==");
 const home = fs.mkdtempSync(path.join(os.tmpdir(), "tg-home-"));
 process.env.DSH_HOME = home;
-const host = await import(path.join(pluginDir, "lib/index.js"));
+const hostUrl = new URL("../lib/index.js", import.meta.url).href;
+// The real dsh runtime supplies defineTool. This test registers the definition
+// with a fake host, so it only needs the definition passed through unchanged.
+const mockDshTools = registerHooks({
+	resolve(specifier, context, nextResolve) {
+		if (specifier === "@deepseek-ai/dsh-tools" && context.parentURL === hostUrl) {
+			return { url: "data:text/javascript,export const defineTool = (definition) => definition", shortCircuit: true };
+		}
+		return nextResolve(specifier, context);
+	}
+});
+const host = await import(hostUrl).finally(() => mockDshTools.deregister());
 ok("host name", host.name === "learning-assistant", host.name);
 ok("host inject 含 tools/webServer", host.inject.includes("tools") && host.inject.includes("webServer"), JSON.stringify(host.inject));
 
@@ -308,6 +322,17 @@ ok("只保留对话里出现的词", scoped.length === 1 && scoped[0].term === "
 ok("大小写不敏感", guide.filterTermsForText([{ term: "vla" }], "VLA 是模型").length === 1);
 ok("空对话返回空", guide.filterTermsForText(allTerms, "").length === 0);
 ok("无关对话返回空", guide.filterTermsForText(allTerms, "今天天气不错").length === 0);
+
+// ---------- 7. Sidebar search ----------
+console.log("\n== 7) 术语搜索 ==");
+const ekf = { term: "EKF", explanation: "用于估计系统状态的滤波算法。" };
+const imu = { term: "IMU", explanation: "测量角速度和加速度的惯性测量单元。" };
+const searchable = [ekf, imu];
+ok("术语名搜索忽略大小写和首尾空格", guide.matchesTermQuery(ekf, " ekf "));
+ok("支持按中文解释搜索", guide.matchesTermQuery(imu, "惯性测量"));
+ok("搜索保留本对话范围", guide.filterTermsForText(searchable, "对话介绍 EKF").filter((item) => guide.matchesTermQuery(item, "惯性")).length === 0);
+ok("清空搜索后恢复当前范围内的词条", searchable.every((item) => guide.matchesTermQuery(item, " ")));
+ok("无解释的旧词条仍可搜索", guide.matchesTermQuery({ term: "RTOS" }, "rtos"));
 
 console.log(`\n${failures === 0 ? "全部通过 ✅" : `${failures} 项失败 ❌`}`);
 process.exit(failures === 0 ? 0 : 1);

@@ -31,11 +31,9 @@
   "files": [
     "lib/index.js",
     "lib/client.js",
-    "lib/client.template.js",
-    "lib/core/*.js",
+    "lib/core/guide.js",
     "lib/core/package.json",
     "cordis.patch.yml",
-    "install.sh",
     "icon.svg",
     "README.md",
     "CHANGELOG.md",

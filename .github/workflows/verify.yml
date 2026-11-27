@@ -7,12 +7,17 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
-      # 零依赖：构建产物校验 + 两端断言，不需要 npm install
+          node-version: ${{ matrix.node }}
+      # 零依赖：构建产物校验 + 两端断言，不需要 npm install。
+      # 没有 dsh 时自检会改用 tools/stubs/dsh-tools.mjs。
       - name: Artifact is up to date
         run: node tools/build-client.mjs --check
       - name: Self-check

@@ -13,3 +13,5 @@
         level: intermediate
         strictness: 50
         autoAdapt: true
+        supplementDebounceMs: 2500
+        supplementCooldownMs: 15000

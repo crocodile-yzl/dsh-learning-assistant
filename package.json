@@ -1,7 +1,7 @@
 {
   "name": "dsh-learning-assistant",
-  "version": "0.3.2",
-  "description": "术语向导：模型照常回答，插件补它没解释的专业词——右侧栏知识树 + 正文高亮 + 一句话解释与学习路径。",
+  "version": "0.4.0",
+  "description": "学习助手：模型照常回答，插件补它没解释的专业词——右侧栏知识树 + 正文高亮 + 一句话解释与学习路径；划词即可解释，学习路径一键填进聊天框接着问。",
   "icon": "./icon.svg",
   "keywords": [
     "deepseek",
@@ -52,7 +52,7 @@
   "homepage": "https://github.com/crocodile-yzl/dsh-learning-assistant#readme",
   "engines": {
     "node": "^22.19.0 || >=24.0.0",
-    "dsh": ">=0.2.0-rc.2"
+    "dsh": ">=0.2.2-rc.1"
   },
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",
@@ -74,7 +74,8 @@
       "inject": [
         "slots",
         "sidebarRight",
-        "sidebarRightTabs"
+        "sidebarRightTabs",
+        "uiConversation"
       ]
     }
   }

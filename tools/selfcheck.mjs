@@ -3,7 +3,8 @@ import vm from "node:vm";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { registerHooks } from "node:module";
 
 const pluginDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
@@ -11,6 +12,29 @@ const ok = (label, cond, extra = "") => {
 	console.log(`${cond ? "✓" : "✗"} ${label}${extra ? " — " + extra : ""}`);
 	if (!cond) failures += 1;
 };
+
+// The host half imports the platform's `defineTool`. Where dsh is installed it
+// resolves from node_modules and the REAL one runs here, which is the better
+// check. On a clean CI runner there is no dsh, and a bare import would abort
+// this file before its first assertion (which is what the verify workflow hit).
+// In that case only, redirect the specifier to a local stand-in that carries a
+// definition through unchanged; the assertions below drive `execute` directly.
+let usedStub = false;
+try {
+	import.meta.resolve("@deepseek-ai/dsh-tools");
+} catch {
+	if (typeof registerHooks === "function") {
+		registerHooks({
+			resolve(specifier, context, nextResolve) {
+				if (specifier === "@deepseek-ai/dsh-tools") {
+					return { url: pathToFileURL(path.join(pluginDir, "tools", "stubs", "dsh-tools.mjs")).href, shortCircuit: true };
+				}
+				return nextResolve(specifier, context);
+			}
+		});
+		usedStub = true;
+	}
+}
 
 // ---------- 1. Browser bundle ----------
 console.log("\n== 1) 浏览器 bundle ==");
@@ -47,6 +71,7 @@ const React = {
 		return { type, props: props ?? {}, children };
 	},
 	useState: (initial) => [typeof initial === "function" ? initial() : initial, () => {}],
+	useRef: (initial) => ({ current: initial }),
 	useEffect: () => {},
 	useLayoutEffect: () => {}
 };
@@ -54,7 +79,16 @@ const registered = [];
 const tabTypes = [];
 const openedTabs = [];
 const disposersClient = [];
+const interactions = [];
 const ctxClient = {
+	uiConversation: {
+		interactions: {
+			register: (definition) => {
+				interactions.push(definition);
+				return () => {};
+			}
+		}
+	},
 	slots: {
 		inject: (_name, factory) => factory(),
 		register: (definition, component) => {
@@ -84,7 +118,17 @@ const mod = captured.descriptor.factory((spec) => {
 	throw new Error(`unexpected require: ${spec}`);
 });
 ok("exports.apply 存在", typeof mod.apply === "function");
-ok("exports.inject 正确", Array.isArray(mod.inject) && mod.inject.includes("slots"), JSON.stringify(mod.inject));
+ok("exports.inject 正确", ["slots", "uiConversation"].every((name) => Array.isArray(mod.inject) && mod.inject.includes(name)), JSON.stringify(mod.inject));
+// A host answer is not a connection failure, and a 404 names the fix.
+const stale = new Error("主机返回 HTTP 404");
+stale.status = 404;
+stale.detail = "not found";
+const noModel = new Error("主机返回 HTTP 503");
+noModel.status = 503;
+noModel.detail = "no model route available";
+ok("404：提示宿主半是旧版并给出办法", mod.describeError(stale).includes("重启 dsh"), mod.describeError(stale));
+ok("503：提示先选择模型", mod.describeError(noModel).includes("选择一个模型"), mod.describeError(noModel));
+ok("连接失败仍写成无法连接主机", mod.describeError(new Error("fetch failed")).startsWith("无法连接主机"), mod.describeError(new Error("fetch failed")));
 mod.apply(ctxClient);
 const names = registered.map((r) => `${r.definition.name}:${r.definition.id ?? r.definition.key}`);
 ok("注册了右侧栏标签类型", tabTypes.length === 1 && tabTypes[0].kind === "learning-assistant", JSON.stringify(tabTypes));
@@ -93,6 +137,18 @@ ok("注册了标签主体", names.includes("sidebar.right.pane.tab:dsh-learning-
 ok("不再占用中间主区域（不会盖住对话）", !names.some((n) => n.startsWith("main:") || n.startsWith("sidebar.panellist:")));
 ok("面板组件是函数", typeof registered.find((r) => r.definition.name === "sidebar.right.pane.tab")?.component === "function");
 ok("注册了常驻入口（对话头部按钮）", names.includes("conversation.session.header.actions:learning-assistant-entry"), names.join(", "));
+ok("注册了划词手势处理器", interactions.length === 1 && interactions[0].id === "learning-assistant-explain", JSON.stringify(interactions.map((i) => i.id)));
+ok("注册了划词动作表面", names.includes("conversation.chat.text-interaction:learning-assistant-explain"), names.join(", "));
+
+// The gesture handler admits a selection with text and nothing else.
+let gestureOpened = 0;
+const gesture = (trigger, text) => interactions[0].onInteraction({ trigger, readText: () => text, open: () => { gestureOpened += 1; } });
+gesture("selection", "KV Cache");
+ok("有文字的划选会打开动作", gestureOpened === 1, String(gestureOpened));
+gesture("selection", "   ");
+gesture("contextmenu", "KV Cache");
+gesture("selection", null);
+ok("空白划选/右键/无文字不打开", gestureOpened === 1, String(gestureOpened));
 
 // Render the panel with seeded state to prove the tree renders.
 const panel = registered.find((r) => r.definition.name === "sidebar.right.pane.tab").component;
@@ -146,6 +202,92 @@ try {
 	ok("空状态渲染", false, error.message);
 }
 
+// Learning path → composer. A path label is a button; one click puts its text
+// into the Session's composer through `inputActions`.
+const findNodes = (root, predicate) => {
+	const found = [];
+	const walk = (node) => {
+		if (node === null || typeof node !== "object") return;
+		if (Array.isArray(node)) {
+			node.forEach(walk);
+			return;
+		}
+		if (predicate(node)) found.push(node);
+		walk(node.children ?? node.props?.children);
+	};
+	walk(root);
+	return found;
+};
+const inserted = [];
+let acceptInsert = true;
+const inputActions = {
+	captureInsertion: () => ({ rev: 1 }),
+	insertText: (text) => {
+		if (!acceptInsert) return false;
+		inserted.push(text);
+		return true;
+	},
+	persistDraft: () => inserted.push("<persist>")
+};
+const stop = () => {};
+try {
+	const store = panelProps.store;
+	store.set(seeded);
+	const treeWithComposer = panel({ ...panelProps, store, inputActions });
+	ok("包装组件把 inputActions 交到面板手上", mod.panelContext.inputActions === inputActions);
+	const askNodes = findNodes(treeWithComposer, (node) => node.props?.["data-learning-assistant-ask"] !== undefined);
+	ok("学习路径的加粗节点是按钮（3 个根节点 + 1 个子节点）", askNodes.length === 4, String(askNodes.length));
+	ok("子节点也可点击", askNodes.some((node) => node.props["data-learning-assistant-ask"] === "Q/K/V 三个投影"));
+	askNodes[0].props.onClick({ stopPropagation: stop });
+	ok("单击把节点文字填进聊天框", inserted.join("|") === "Transformer 自注意力|<persist>", inserted.join("|"));
+	askNodes[0].props.onClick({ stopPropagation: stop });
+	ok("连点不会填两次", inserted.length === 2, String(inserted.length));
+	ok("填入后面板给出提示", String(store.get().notice ?? "").includes("已填入聊天框"), String(store.get().notice));
+	acceptInsert = false;
+	askNodes[1].props.onClick({ stopPropagation: stop });
+	ok("编辑器被锁时如实提示", String(store.get().notice ?? "").includes("正在发送"), String(store.get().notice));
+	acceptInsert = true;
+	// Rendered WITHOUT inputActions: the handoff from the wrapper is used.
+	findNodes(panel({ ...panelProps, store }), (node) => node.props?.["data-learning-assistant-ask"] !== undefined)[3].props.onClick({ stopPropagation: stop });
+	ok("没有 slot props 时回退到交接的 inputActions", inserted.includes("KV Cache"), inserted.join("|"));
+} catch (error) {
+	ok("学习路径填入聊天框", false, error.message);
+}
+
+// The selection action: remembered → open the card; new → one explain call.
+try {
+	const store = panelProps.store;
+	store.set(seeded);
+	const api = panelProps.api;
+	let explainCalls = 0;
+	api.explain = async (term, context) => {
+		explainCalls += 1;
+		return { terms: [...seeded.terms, { term, explanation: "按序投三份。", tree: [], links: [], source: "manual" }], level: "intermediate", strictness: 55, updatedAt: "2026-11-25T00:00:00.000Z", term, existing: false };
+	};
+	const ExplainAction = registered.find((r) => r.definition.key === "learning-assistant-explain")?.component;
+	ok("划词动作组件存在", typeof ExplainAction === "function");
+	let cleared = 0;
+	let dismissed = 0;
+	const surface = (text) => ExplainAction({ readText: () => text, clearSelection: () => { cleared += 1; }, dismiss: () => { dismissed += 1; } });
+	ok("没有选区时不渲染", surface("") === null);
+	const button = surface("Q/K/V 三个投影");
+	ok("有选区时渲染按钮", button?.type === "button" && String(button.children).includes("解释这个词"), String(button?.children));
+	const before = openedTabs.length;
+	await button.props.onClick();
+	ok("新词：调用一次 /explain", explainCalls === 1, String(explainCalls));
+	ok("新词：已进记忆并标为划词添加", store.get().terms.some((item) => item.term === "Q/K/V 三个投影" && item.source === "manual"));
+	ok("新词：侧栏打开并定位到该词", openedTabs.length === before + 1 && store.get().focus?.term === "Q/K/V 三个投影", JSON.stringify(store.get().focus));
+	ok("新词：释放选区并关闭动作", cleared === 1 && dismissed === 1, `${cleared}/${dismissed}`);
+	await surface("kv cache").props.onClick();
+	ok("已收录词（大小写不同）：不再调模型", explainCalls === 1, String(explainCalls));
+	ok("已收录词：直接定位到已有卡片", store.get().focus?.term === "KV Cache", JSON.stringify(store.get().focus));
+	store.set({ focus: null });
+	await surface("长".repeat(70)).props.onClick();
+	ok("选区过长：拒绝并提示", explainCalls === 1 && String(store.get().notice ?? "").includes("太长"), String(store.get().notice));
+} catch (error) {
+	ok("划词解释动作", false, error.message);
+}
+
 // ---------- 2. Host half ----------
 console.log("\n== 2) Host 半 ==");
 const home = fs.mkdtempSync(path.join(os.tmpdir(), "tg-home-"));
@@ -159,6 +301,24 @@ let routeRegistration;
 let promptSection;
 const disposers = [];
 const eventHandlers = [];
+// A model that answers from a queue. Each `stream` call records its request and
+// yields the next scripted reply as one text delta.
+const llmCalls = [];
+const llmReplies = [];
+const fakeLlm = {
+	listProviders: () => [{ provider: "fake" }],
+	listModels: async () => [{ model: "fake-1" }],
+	stream: (request) => {
+		llmCalls.push(request);
+		const reply = llmReplies.shift() ?? "[]";
+		// Answer after a real tick, not a microtask, so passes overlap the way
+		// they do against a live model and the concurrency cap is exercised.
+		return (async function* () {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			yield { type: "text-delta", text: reply };
+		})();
+	}
+};
 const ctxHost = {
 	on: (name, handler) => {
 		eventHandlers.push({ name, handler });
@@ -167,14 +327,19 @@ const ctxHost = {
 	tools: { register: (def) => { toolDef = def; return () => {}; } },
 	webServer: { register: (opts) => { routeRegistration = opts; return () => {}; } },
 	effect: (fn) => { disposers.push(fn()); return () => {}; },
-	inject: (_names, cb) => {
-		cb({
-			effect: (fn) => { disposers.push(fn()); return () => {}; },
-			systemPrompt: { section: (section) => { promptSection = section; return () => {}; } }
-		});
+	inject: (names, cb) => {
+		const scope = { effect: (fn) => { disposers.push(fn()); return () => {}; } };
+		if (names.includes("systemPrompt")) scope.systemPrompt = { section: (section) => { promptSection = section; return () => {}; } };
+		if (names.includes("llm")) {
+			scope.llm = fakeLlm;
+			scope.agentDefaultModel = null;
+		}
+		cb(scope);
 	}
 };
-host.apply(ctxHost, { level: "intermediate", strictness: 50 });
+// Timings are configuration so this check need not wait seconds per pass.
+host.apply(ctxHost, { level: "intermediate", strictness: 50, supplementDebounceMs: 5, supplementCooldownMs: 0 });
+ok("宿主使用了真实的 defineTool（CI 上为本地替身）", true, usedStub ? "stub" : "real");
 ok("注册了 explain_terms 工具", toolDef?.name === "explain_terms", toolDef?.name);
 ok("注册了 /learning-assistant 路由", routeRegistration?.path === "/learning-assistant", routeRegistration?.path);
 ok("注册了系统提示段", promptSection?.name === "learning-assistant");
@@ -223,6 +388,102 @@ ok("POST /level 生效", JSON.parse(res2.body).level === "expert", res2.body);
 const res3 = { status: 0, body: "", writeHead(s) { this.status = s; }, end(t) { this.body = t; } };
 await routeRegistration.handler(Object.assign(Readable.from([Buffer.from(JSON.stringify({ term: "KV Cache" }))]), { method: "POST", url: "/learning-assistant/forget" }), res3);
 ok("POST /forget 生效", JSON.parse(res3.body).terms.length === 1, res3.body);
+
+// A small route caller: JSON in, `{ status, json }` out.
+const call = async (method, url, body) => {
+	const res = { status: 0, body: "", writeHead(s) { this.status = s; }, end(t) { this.body = t; } };
+	const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body))];
+	await routeRegistration.handler(Object.assign(Readable.from(chunks), { method, url }), res);
+	return { status: res.status, body: res.body, json: () => JSON.parse(res.body) };
+};
+const { createRequire: createRequireHost } = await import("node:module");
+const guideHost = createRequireHost(path.join(pluginDir, "lib/index.js"))("./core/guide.js");
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ---- one term, several spellings ----
+console.log("\n== 2b) 术语名归一化 ==");
+ok("termKey 折叠大小写与空白", guideHost.termKey(" KV   Cache ") === "kv cache", guideHost.termKey(" KV   Cache "));
+ok("termKey 折叠全角", guideHost.termKey("ＶＬＡ") === "vla", guideHost.termKey("ＶＬＡ"));
+const folded = guideHost.mergeTerms(guideHost.emptyMemory(), [
+	{ term: "VLA", explanation: "甲", tree: [], links: [] },
+	{ term: "vla", explanation: "乙", tree: [], links: [] },
+	{ term: "ＶＬＡ", explanation: "丙", tree: [], links: [] }
+], { now: new Date() });
+ok("三种拼写合并为一个词条，计数累加", folded.terms.length === 1 && folded.terms[0].count === 3, JSON.stringify(folded.terms.map((t) => [t.term, t.count])));
+ok("显示名保留首次拼写", folded.terms[0].term === "VLA", folded.terms[0].term);
+const linkedTree = guideHost.buildKnowledgeTree([{ term: "Transformer" }, { term: "ViT", parent: "transformer" }]);
+ok("parent 与词条大小写不同也能挂上", linkedTree.length === 1 && linkedTree[0].children?.[0]?.term.term === "ViT", JSON.stringify(linkedTree.map((n) => n.term.term)));
+ok("对话过滤对全角不敏感", guideHost.filterTermsForText([{ term: "VLA" }], "ＶＬＡ 是模型").length === 1);
+const familiar = guideHost.mostFamiliar({ terms: [{ term: "甲", count: 1 }, { term: "乙", count: 5 }, { term: "丙", count: 3 }] }, 2);
+ok("已收录词按常见度排序取前 N", familiar.join(",") === "乙,丙", familiar.join(","));
+
+// ---- the tool and the routes agree on that identity ----
+const again = await toolDef.execute({ terms: [{ term: "a2a 协议", explanation: "换个小写再记一次。", tree: [], links: [] }] });
+ok("工具：小写重复不新增词条", again.saved === 1 && again.total === 1, JSON.stringify(again));
+ok("工具：回报的是已存的显示名", again.terms[0] === "A2A 协议", again.terms[0]);
+const forgotten = await call("POST", "/learning-assistant/forget", { term: "A2A 协议" });
+ok("/forget 按归一化后的名字删除", forgotten.json().terms.length === 0, forgotten.json().terms.length);
+
+// ---- polling: "unchanged" instead of resending everything ----
+const s1 = await call("GET", "/learning-assistant/state");
+ok("GET /state 带 corrupted 字段", s1.json().corrupted === null, String(s1.json().corrupted));
+const s2 = await call("GET", `/learning-assistant/state?since=${encodeURIComponent(s1.json().updatedAt)}`);
+ok("同一版本返回 unchanged", s2.json().unchanged === true, JSON.stringify(s2.json()));
+const s3 = await call("GET", "/learning-assistant/state?since=2000-01-01T00:00:00.000Z");
+ok("不同版本返回完整状态", Array.isArray(s3.json().terms), JSON.stringify(Object.keys(s3.json())));
+
+// ---- an unreadable memory file is moved aside, not served forever ----
+fs.writeFileSync(memoryFile, "{ this is not json");
+const broken = await call("GET", "/learning-assistant/state");
+const dir = path.dirname(memoryFile);
+const backups = fs.readdirSync(dir).filter((name) => name.startsWith("terms.json.corrupt-"));
+ok("坏文件：仍返回 200 与空记忆", broken.status === 200 && broken.json().terms.length === 0, String(broken.status));
+ok("坏文件：原文件被移走并备份", !fs.existsSync(memoryFile) && backups.length === 1, backups.join(","));
+ok("坏文件：告诉页面备份位置", typeof broken.json().corrupted === "string" && broken.json().corrupted.includes("corrupt-"), String(broken.json().corrupted));
+const repaired = await call("POST", "/learning-assistant/level", { level: "intermediate" });
+ok("一次成功写入后清除损坏提示", repaired.json().corrupted === null, `${repaired.status} ${repaired.body.slice(0, 160)}`);
+
+// ---- /explain: the selection route ----
+console.log("\n== 2c) 划词解释路由 ==");
+llmReplies.push(JSON.stringify({ explanation: "把图切成小块当 token 的 Transformer。", category: "深度学习", tree: [{ label: "自注意力" }, { label: "ViT" }], parent: "不存在的词" }));
+const ex1 = await call("POST", "/learning-assistant/explain", { term: "ViT", context: "主干网络用 ViT 提特征。" });
+ok("新词：200 并入库", ex1.status === 200 && ex1.json().existing === false && ex1.json().term === "ViT", ex1.body.slice(0, 80));
+ok("新词：标记为划词添加", ex1.json().terms.some((t) => t.term === "ViT" && t.source === "manual"));
+ok("新词：带上下文调用模型", String(llmCalls.at(-1).messages[0].content[0].text).includes("主干网络用 ViT 提特征"));
+const callsBeforeExplain = llmCalls.length;
+const ex2 = await call("POST", "/learning-assistant/explain", { term: "vit" });
+ok("已收录词：不再调模型", ex2.json().existing === true && ex2.json().term === "ViT" && llmCalls.length === callsBeforeExplain, ex2.body.slice(0, 60));
+ok("选区过长：413", (await call("POST", "/learning-assistant/explain", { term: "长".repeat(70) })).status === 413);
+ok("空选区：400", (await call("POST", "/learning-assistant/explain", { term: "   " })).status === 400);
+
+// ---- the automatic pass: locks per conversation, one write per pass ----
+console.log("\n== 2d) 自动补充的会话隔离 ==");
+const emit = (session, type, data) => {
+	for (const { name, handler } of eventHandlers) if (name === "session/event") handler({ id: session }, { type, data });
+};
+const answer = (text) => ({ message: { content: [{ type: "text", text }] } });
+const longAnswer = "这是一段足够长的回答，用来触发一次自动补充解释。".repeat(3);
+for (const term of ["ROS2", "MoveIt", "CUDA"]) llmReplies.push(JSON.stringify([{ term, explanation: `${term} 的解释。`, tree: [], links: [] }]));
+const callsBeforePass = llmCalls.length;
+emit("s1", "assistant/message", answer(longAnswer));
+emit("s2", "assistant/message", answer(longAnswer));
+emit("s3", "assistant/message", answer(longAnswer));
+await sleep(80);
+ok("三个会话同时结束：模型调用受并发上限 2 约束", llmCalls.length === callsBeforePass + 2, String(llmCalls.length - callsBeforePass));
+emit("s3", "assistant/message", answer(longAnswer));
+await sleep(80);
+ok("被上限挡下的会话下一轮能补上", llmCalls.length === callsBeforePass + 3, String(llmCalls.length - callsBeforePass));
+const afterPass = JSON.parse(fs.readFileSync(memoryFile, "utf8"));
+ok("三个会话的词都已入库并标为自动补充", ["ROS2", "MoveIt", "CUDA"].every((term) => afterPass.terms.some((t) => t.term === term && t.source === "supplement")), afterPass.terms.map((t) => t.term).join(","));
+llmReplies.push(JSON.stringify([{ term: "RViz", explanation: "可视化工具。", tree: [], links: [] }, { term: "URDF", explanation: "机器人描述格式。", tree: [], links: [] }]));
+const signalsBefore = afterPass.signals.length;
+const termsBefore = afterPass.terms.length;
+emit("s1", "assistant/message", answer(longAnswer));
+await sleep(80);
+const afterTwo = JSON.parse(fs.readFileSync(memoryFile, "utf8"));
+ok("一轮补两个词只记一条 signal（一次合并写入）", afterTwo.signals.length === signalsBefore + 1 && afterTwo.terms.length === termsBefore + 2, `${afterTwo.signals.length - signalsBefore}/${afterTwo.terms.length - termsBefore}`);
+const repeated = await call("POST", "/learning-assistant/explain", { term: "ViT" });
+ok("自动补充之后已收录词仍可直接打开", repeated.json().existing === true, String(repeated.json().existing));
 
 // ---------- 3. Inline highlighting ----------
 console.log("\n== 3) 正文高亮 ==");
@@ -289,19 +550,8 @@ ok("缺失父级标记", orphan?.orphanParent === "不存在的词", String(orph
 const cyclic = guide.buildKnowledgeTree([{ term: "A", parent: "B" }, { term: "B", parent: "A" }]);
 ok("环形关系不会死循环", cyclic.length === 2 && cyclic.every((n) => n.children.length === 0), JSON.stringify(cyclic.map((n) => n.term.term)));
 
-// ---------- 5. Deterministic candidate extraction ----------
-console.log("\n== 5) 自动补充的候选抽取 ==");
-const answer = "VLA 是视觉-语言-动作模型。常见框架有 OpenVLA、π0、GR00T。VLA 与 RT-2 一脉相承，部署时常用 ROS2 和 CUDA。";
-const picked = guide.extractCandidates(answer, ["RTOS", "KV Cache"], 3);
-ok("抽出未收录的缩写", picked.includes("VLA"), picked.join(","));
-ok("已在记忆的词不重复", !picked.includes("RTOS"), picked.join(","));
-ok("通用缩写被过滤", !picked.includes("CUDA") || true, picked.join(","));
-ok("数量受 limit 限制", guide.extractCandidates(answer, [], 2).length <= 2);
-ok("按出现次数排序（VLA 出现两次在前）", picked[0] === "VLA", picked.join(","));
-ok("空文本返回空数组", guide.extractCandidates("", ["x"], 2).length === 0);
-
-// ---------- 6. Per-conversation scope ----------
-console.log("\n== 6) 展示按对话过滤 ==");
+// ---------- 5. Per-conversation scope ----------
+console.log("\n== 5) 展示按对话过滤 ==");
 const allTerms = [{ term: "RTOS" }, { term: "VLA" }, { term: "KV Cache" }];
 const scoped = guide.filterTermsForText(allTerms, "本对话在讲 VLA 与机器人");
 ok("只保留对话里出现的词", scoped.length === 1 && scoped[0].term === "VLA", scoped.map((t) => t.term).join(","));
